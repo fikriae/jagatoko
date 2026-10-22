@@ -198,7 +198,7 @@ class _LoginPageState extends State<LoginPage> {
                   Center(
                     child: Image.asset(
                       'assets/images/jagatoko_logo.png',
-                      height: 110,
+                      height: 170,
                       fit: BoxFit.contain,
                       errorBuilder: (context, error, stackTrace) {
                         return const Icon(

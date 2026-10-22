@@ -1,8 +1,6 @@
-
 import 'package:flutter/material.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
-
 import '../services/database_service.dart';
 
 class KasirPage extends StatefulWidget {
@@ -15,21 +13,20 @@ class KasirPage extends StatefulWidget {
 class _KasirPageState extends State<KasirPage> {
   final SupabaseClient _supabase = Supabase.instance.client;
   final DatabaseService _databaseService = DatabaseService();
-
   final TextEditingController _searchController = TextEditingController();
   final TextEditingController _customerController =
       TextEditingController(text: 'Umum');
   final TextEditingController _paymentController = TextEditingController();
-
   final Map<String, Map<String, dynamic>> _cart = {};
-
   String _paymentMethod = 'cash';
   String _searchQuery = '';
+  String _cashierName = 'Kasir';
   bool _loadingCheckout = false;
   bool _loadingProducts = true;
-
   List<Map<String, dynamic>> _products = [];
-  String _cashierName = 'Kasir';
+  static const Color _primary = Color(0xFF2563EB);
+  static const Color _background = Color(0xFFF8FAFC);
+  static const Color _border = Color(0xFFE2E8F0);
 
   @override
   void initState() {
@@ -48,7 +45,9 @@ class _KasirPageState extends State<KasirPage> {
 
   double _number(dynamic value) {
     if (value is num) return value.toDouble();
-    return double.tryParse(value?.toString() ?? '') ?? 0;
+    if (value == null) return 0;
+    final cleaned = value.toString().replaceAll(',', '').trim();
+    return double.tryParse(cleaned) ?? 0;
   }
 
   int _integer(dynamic value) {
@@ -56,19 +55,21 @@ class _KasirPageState extends State<KasirPage> {
     return int.tryParse(value?.toString() ?? '') ?? 0;
   }
 
+  // Sumber harga jual utama adalah kolom selling_price di Supabase.
+  double _sellingPrice(Map<String, dynamic> product) {
+    return _number(product['selling_price']);
+  }
+
   String _rupiah(num value) {
     final text = value.round().abs().toString();
     final result = StringBuffer();
-
     for (int i = 0; i < text.length; i++) {
       result.write(text[i]);
       final remaining = text.length - i - 1;
-
       if (remaining > 0 && remaining % 3 == 0) {
         result.write('.');
       }
     }
-
     return '${value < 0 ? '-' : ''}Rp$result';
   }
 
@@ -81,49 +82,56 @@ class _KasirPageState extends State<KasirPage> {
     if (mounted) {
       setState(() => _loadingProducts = true);
     }
-
     try {
       final response = await _supabase
           .from('products')
           .select()
           .order('name');
+      final products = List<Map<String, dynamic>>.from(
+        (response as List).map((row) {
+          final product = Map<String, dynamic>.from(row);
 
+          // Samakan seluruh pembacaan harga dengan kolom selling_price.
+          product['selling_price'] = _sellingPrice(product);
+          product['price'] = _sellingPrice(product);
+          return product;
+        }),
+      );
       if (!mounted) return;
-
-      final products = List<Map<String, dynamic>>.from(response);
-
       setState(() {
         _products = products;
 
+        // Sinkronkan harga dan stok keranjang dengan data terbaru.
         for (final entry in _cart.entries.toList()) {
-          final product = products.where(
-            (p) => (p['id'] ?? '').toString() == entry.key,
+          final matches = products.where(
+            (product) =>
+                (product['id'] ?? '').toString() == entry.key,
           );
-
-          if (product.isEmpty) {
+          if (matches.isEmpty) {
             _cart.remove(entry.key);
             continue;
           }
-
-          final currentStock = _integer(product.first['stock']);
+          final product = matches.first;
+          final currentStock = _integer(product['stock']);
+          final currentPrice = _sellingPrice(product);
+          entry.value['price'] = currentPrice;
           entry.value['stock'] = currentStock;
-
-          if (_integer(entry.value['quantity']) > currentStock) {
-            entry.value['quantity'] = currentStock;
-          }
-
+          entry.value['productName'] =
+              (product['name'] ?? 'Produk').toString();
+          entry.value['imageUrl'] =
+              (product['image_url'] ?? '').toString();
+          final quantity = _integer(entry.value['quantity']);
           if (currentStock <= 0) {
             _cart.remove(entry.key);
+          } else if (quantity > currentStock) {
+            entry.value['quantity'] = currentStock;
           }
         }
-
         _loadingProducts = false;
       });
     } catch (e) {
       if (!mounted) return;
-
       setState(() => _loadingProducts = false);
-
       _showMessage('Gagal mengambil produk: $e');
     }
   }
@@ -131,23 +139,19 @@ class _KasirPageState extends State<KasirPage> {
   Future<void> _loadCashier() async {
     final user = _supabase.auth.currentUser;
     if (user == null) return;
-
     try {
       final profile = await _supabase
           .from('profiles')
           .select('name')
           .eq('id', user.id)
           .maybeSingle();
-
       if (!mounted) return;
-
       setState(() {
         _cashierName =
             (profile?['name'] ?? user.email ?? 'Kasir').toString();
       });
     } catch (_) {
       if (!mounted) return;
-
       setState(() {
         _cashierName = user.email ?? 'Kasir';
       });
@@ -156,35 +160,29 @@ class _KasirPageState extends State<KasirPage> {
 
   List<Map<String, dynamic>> get _filteredProducts {
     final query = _searchQuery.trim().toLowerCase();
-
     if (query.isEmpty) return _products;
-
     return _products.where((product) {
       final name = (product['name'] ?? '').toString().toLowerCase();
       final barcode =
           (product['barcode'] ?? '').toString().toLowerCase();
-
       return name.contains(query) || barcode.contains(query);
     }).toList();
   }
 
   double get _total {
     double total = 0;
-
     for (final item in _cart.values) {
-      total += _number(item['price']) * _integer(item['quantity']);
+      total +=
+          _number(item['price']) * _integer(item['quantity']);
     }
-
     return total;
   }
 
   int get _totalItems {
     int total = 0;
-
     for (final item in _cart.values) {
       total += _integer(item['quantity']);
     }
-
     return total;
   }
 
@@ -195,70 +193,64 @@ class _KasirPageState extends State<KasirPage> {
 
   void _addProduct(Map<String, dynamic> product) {
     final id = (product['id'] ?? '').toString();
-
     if (id.isEmpty) {
       _showMessage('Produk tidak memiliki ID.');
       return;
     }
-
     final stock = _integer(product['stock']);
-
+    final price = _sellingPrice(product);
     if (stock <= 0) {
       _showMessage('Stok ${product['name']} habis.');
       return;
     }
-
+    if (price < 0) {
+      _showMessage('Harga produk tidak valid.');
+      return;
+    }
     final existing = _cart[id];
-
     if (existing != null) {
       final quantity = _integer(existing['quantity']);
-
       if (quantity >= stock) {
         _showMessage('Jumlah melebihi stok yang tersedia.');
         return;
       }
-
       setState(() {
         existing['quantity'] = quantity + 1;
+        existing['price'] = price;
+        existing['stock'] = stock;
       });
     } else {
       setState(() {
         _cart[id] = {
           'productId': id,
-          'productName': (product['name'] ?? '').toString(),
-          'price': _number(product['price']),
+          'productName': (product['name'] ?? 'Produk').toString(),
+          'price': price,
           'purchasePrice': _number(
             product['purchase_price'] ?? product['purchasePrice'],
           ),
           'quantity': 1,
           'stock': stock,
-          'imageUrl':
-              (product['image_url'] ?? product['imageUrl'] ?? '').toString(),
+          'imageUrl': (product['image_url'] ?? '').toString(),
         };
       });
     }
-
     _showMessage('${product['name']} ditambahkan ke keranjang.');
   }
 
   void _changeQuantity(String id, int difference) {
     final item = _cart[id];
     if (item == null) return;
-
     final current = _integer(item['quantity']);
     final next = current + difference;
     final stock = _integer(item['stock']);
-
     if (next <= 0) {
       _removeProduct(id);
       return;
     }
-
     if (next > stock) {
       _showMessage('Jumlah tidak boleh melebihi stok.');
       return;
     }
-
     setState(() {
       item['quantity'] = next;
     });
@@ -266,7 +258,6 @@ class _KasirPageState extends State<KasirPage> {
 
   void _removeProduct(String id) {
     if (!_cart.containsKey(id)) return;
-
     setState(() {
       _cart.remove(id);
     });
@@ -274,7 +265,6 @@ class _KasirPageState extends State<KasirPage> {
 
   void _showMessage(String message) {
     if (!mounted) return;
-
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
@@ -289,7 +279,6 @@ class _KasirPageState extends State<KasirPage> {
         '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
     final time =
         '${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}${now.second.toString().padLeft(2, '0')}${now.millisecond.toString().padLeft(3, '0')}';
-
     return 'INV-$date-$time';
   }
 
@@ -300,28 +289,28 @@ class _KasirPageState extends State<KasirPage> {
         builder: (_) => const _BarcodeScannerPage(),
       ),
     );
-
     if (result == null || result.trim().isEmpty || !mounted) return;
-
     final barcode = result.trim();
-
-    setState(() {
-      _searchController.text = barcode;
-      _searchQuery = barcode;
-    });
-
     final matches = _products.where((product) {
       return (product['barcode'] ?? '').toString().trim() == barcode;
     }).toList();
 
+    // Barcode tidak dibiarkan tertinggal di kolom pencarian.
+    setState(() {
+      _searchController.clear();
+      _searchQuery = '';
+    });
     if (matches.isEmpty) {
       _showMessage('Produk dengan barcode tersebut tidak ditemukan.');
       return;
     }
 
-    _showMessage(
-      'Produk ditemukan. Tekan tombol Tambah untuk memasukkan ke keranjang.',
-    );
+    // Otomatis tambahkan satu unit produk ke keranjang.
+
+    // _addProduct tetap memvalidasi stok dan menambah jumlah jika produk
+
+    // tersebut sudah ada di keranjang.
+    _addProduct(matches.first);
   }
 
   Future<void> _showCheckoutDialog() async {
@@ -329,11 +318,9 @@ class _KasirPageState extends State<KasirPage> {
       _showMessage('Keranjang masih kosong.');
       return;
     }
-
     _customerController.text = 'Umum';
     _paymentMethod = 'cash';
     _paymentController.clear();
-
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -347,7 +334,6 @@ class _KasirPageState extends State<KasirPage> {
                 ? total
                 : _parsePayment(_paymentController.text);
             final change = paid - total;
-
             return Padding(
               padding: EdgeInsets.fromLTRB(
                 20,
@@ -384,16 +370,16 @@ class _KasirPageState extends State<KasirPage> {
                     ),
                     const SizedBox(height: 16),
                     ..._cart.values.toList().map((item) {
-                      final imageUrl = (item['imageUrl'] ?? '').toString();
+                      final imageUrl =
+                          (item['imageUrl'] ?? '').toString();
                       final quantity = _integer(item['quantity']);
                       final price = _number(item['price']);
                       final id = item['productId'].toString();
-
                       return Container(
                         margin: const EdgeInsets.only(bottom: 10),
                         padding: const EdgeInsets.all(10),
                         decoration: BoxDecoration(
-                          color: const Color(0xFFF8FAFC),
+                          color: _background,
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: Row(
@@ -586,14 +572,12 @@ class _KasirPageState extends State<KasirPage> {
                                   _showMessage('Keranjang masih kosong.');
                                   return;
                                 }
-
                                 if (paid < total) {
                                   _showMessage(
                                     'Uang pembayaran belum cukup.',
                                   );
                                   return;
                                 }
-
                                 Navigator.pop(sheetContext);
                                 await _processCheckout();
                               },
@@ -613,7 +597,7 @@ class _KasirPageState extends State<KasirPage> {
                               : 'Selesaikan Pembayaran',
                         ),
                         style: ElevatedButton.styleFrom(
-                          backgroundColor: const Color(0xFF2563EB),
+                          backgroundColor: _primary,
                           foregroundColor: Colors.white,
                           shape: RoundedRectangleBorder(
                             borderRadius: BorderRadius.circular(12),
@@ -633,44 +617,85 @@ class _KasirPageState extends State<KasirPage> {
 
   Future<void> _processCheckout() async {
     if (_cart.isEmpty) return;
-
     final user = _supabase.auth.currentUser;
-
     if (user == null) {
       _showMessage('Silakan login terlebih dahulu.');
       return;
     }
 
+    // Ambil ulang harga jual dan stok sebelum transaksi disimpan.
+    try {
+      final ids = _cart.keys.toList();
+      final latestResponse = await _supabase
+          .from('products')
+          .select()
+          .inFilter('id', ids);
+      final latestProducts = List<Map<String, dynamic>>.from(
+        (latestResponse as List).map(
+          (row) => Map<String, dynamic>.from(row),
+        ),
+      );
+      for (final entry in _cart.entries) {
+        final matches = latestProducts.where(
+          (product) =>
+              (product['id'] ?? '').toString() == entry.key,
+        );
+        if (matches.isEmpty) {
+          _showMessage(
+            'Produk ${entry.value['productName']} tidak ditemukan lagi.',
+          );
+          return;
+        }
+        final product = matches.first;
+        final latestStock = _integer(product['stock']);
+        final latestPrice = _sellingPrice(product);
+        final quantity = _integer(entry.value['quantity']);
+        if (latestStock < quantity) {
+          _showMessage(
+            'Stok ${product['name']} tidak cukup. Stok tersedia: $latestStock.',
+          );
+          await _loadProducts();
+          return;
+        }
+
+        // Gunakan harga jual terbaru dari database.
+        entry.value['price'] = latestPrice;
+        entry.value['stock'] = latestStock;
+        entry.value['productName'] =
+            (product['name'] ?? 'Produk').toString();
+        entry.value['imageUrl'] =
+            (product['image_url'] ?? '').toString();
+      }
+    } catch (e) {
+      _showMessage('Gagal memeriksa harga dan stok terbaru: $e');
+      return;
+    }
+    if (!mounted) return;
     final total = _total;
     final payment = _paymentMethod == 'qris'
         ? total
         : _parsePayment(_paymentController.text);
-
     if (payment < total) {
       _showMessage('Uang pembayaran belum cukup.');
       return;
     }
-
     final customerName = _customerController.text.trim().isEmpty
         ? 'Umum'
         : _customerController.text.trim();
-
     final items = _cart.values.map((item) {
+      final price = _number(item['price']);
+      final quantity = _integer(item['quantity']);
       return <String, dynamic>{
         'productId': item['productId'],
         'productName': item['productName'],
-        'price': _number(item['price']).round(),
+        'price': price.round(),
         'purchasePrice': _number(item['purchasePrice']).round(),
-        'quantity': _integer(item['quantity']),
-        'subtotal': (
-          _number(item['price']) * _integer(item['quantity'])
-        ).round(),
+        'quantity': quantity,
+        'subtotal': (price * quantity).round(),
         'imageUrl': item['imageUrl'] ?? '',
       };
     }).toList();
-
     setState(() => _loadingCheckout = true);
-
     try {
       await _databaseService.processSale(
         invoice: _generateInvoice(),
@@ -684,20 +709,18 @@ class _KasirPageState extends State<KasirPage> {
         cashierName: _cashierName,
         items: items,
       );
-
       if (!mounted) return;
-
+      final completedMethod = _paymentMethod;
+      final completedTotal = total;
+      final completedChange = payment - total;
       setState(() {
         _cart.clear();
         _paymentController.clear();
         _customerController.text = 'Umum';
         _loadingCheckout = false;
       });
-
       await _loadProducts();
-
       if (!mounted) return;
-
       showDialog<void>(
         context: context,
         barrierDismissible: false,
@@ -715,18 +738,18 @@ class _KasirPageState extends State<KasirPage> {
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text('Total: ${_rupiah(total)}'),
+                Text('Total: ${_rupiah(completedTotal)}'),
                 const SizedBox(height: 6),
-                Text('Metode: ${_paymentMethod.toUpperCase()}'),
+                Text('Metode: ${completedMethod.toUpperCase()}'),
                 const SizedBox(height: 6),
-                Text('Kembalian: ${_rupiah(payment - total)}'),
+                Text('Kembalian: ${_rupiah(completedChange)}'),
               ],
             ),
             actions: [
               FilledButton(
                 onPressed: () => Navigator.pop(dialogContext),
                 style: FilledButton.styleFrom(
-                  backgroundColor: const Color(0xFF2563EB),
+                  backgroundColor: _primary,
                 ),
                 child: const Text('Selesai'),
               ),
@@ -736,7 +759,6 @@ class _KasirPageState extends State<KasirPage> {
       );
     } catch (e) {
       if (!mounted) return;
-
       setState(() => _loadingCheckout = false);
       _showMessage('Transaksi gagal: $e');
     }
@@ -827,9 +849,7 @@ class _KasirPageState extends State<KasirPage> {
         decoration: BoxDecoration(
           color: selected ? const Color(0xFFEFF6FF) : Colors.white,
           border: Border.all(
-            color: selected
-                ? const Color(0xFF2563EB)
-                : const Color(0xFFE2E8F0),
+            color: selected ? _primary : _border,
             width: selected ? 1.5 : 1,
           ),
           borderRadius: BorderRadius.circular(12),
@@ -839,18 +859,14 @@ class _KasirPageState extends State<KasirPage> {
           children: [
             Icon(
               icon,
-              color: selected
-                  ? const Color(0xFF2563EB)
-                  : Colors.grey,
+              color: selected ? _primary : Colors.grey,
             ),
             const SizedBox(width: 8),
             Text(
               label,
               style: TextStyle(
                 fontWeight: FontWeight.w600,
-                color: selected
-                    ? const Color(0xFF2563EB)
-                    : Colors.black87,
+                color: selected ? _primary : Colors.black87,
               ),
             ),
           ],
@@ -862,17 +878,15 @@ class _KasirPageState extends State<KasirPage> {
   Widget _buildProductCard(Map<String, dynamic> product) {
     final id = (product['id'] ?? '').toString();
     final name = (product['name'] ?? 'Produk').toString();
-    final price = _number(product['price']);
+    final price = _sellingPrice(product);
     final stock = _integer(product['stock']);
-    final imageUrl =
-        (product['image_url'] ?? product['imageUrl'] ?? '').toString();
+    final imageUrl = (product['image_url'] ?? '').toString();
     final inCart = _cart.containsKey(id);
-
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(14),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
+        border: Border.all(color: _border),
       ),
       child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
@@ -935,7 +949,7 @@ class _KasirPageState extends State<KasirPage> {
                 Text(
                   _rupiah(price),
                   style: const TextStyle(
-                    color: Color(0xFF2563EB),
+                    color: _primary,
                     fontSize: 14,
                     fontWeight: FontWeight.bold,
                   ),
@@ -945,7 +959,9 @@ class _KasirPageState extends State<KasirPage> {
                   width: double.infinity,
                   height: 36,
                   child: ElevatedButton.icon(
-                    onPressed: stock <= 0 ? null : () => _addProduct(product),
+                    onPressed: stock <= 0
+                        ? null
+                        : () => _addProduct(product),
                     icon: Icon(
                       inCart ? Icons.add : Icons.add_shopping_cart,
                       size: 16,
@@ -955,7 +971,7 @@ class _KasirPageState extends State<KasirPage> {
                       style: const TextStyle(fontSize: 12),
                     ),
                     style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF2563EB),
+                      backgroundColor: _primary,
                       foregroundColor: Colors.white,
                       disabledBackgroundColor: Colors.grey.shade300,
                       padding: const EdgeInsets.symmetric(horizontal: 6),
@@ -977,9 +993,7 @@ class _KasirPageState extends State<KasirPage> {
     return Container(
       decoration: const BoxDecoration(
         color: Colors.white,
-        border: Border(
-          top: BorderSide(color: Color(0xFFE2E8F0)),
-        ),
+        border: Border(top: BorderSide(color: _border)),
       ),
       padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
       child: SafeArea(
@@ -991,7 +1005,7 @@ class _KasirPageState extends State<KasirPage> {
               children: [
                 const Icon(
                   Icons.shopping_cart_outlined,
-                  color: Color(0xFF2563EB),
+                  color: _primary,
                 ),
                 const SizedBox(width: 8),
                 const Expanded(
@@ -1015,7 +1029,7 @@ class _KasirPageState extends State<KasirPage> {
                   child: Text(
                     '$_totalItems item',
                     style: const TextStyle(
-                      color: Color(0xFF2563EB),
+                      color: _primary,
                       fontWeight: FontWeight.w600,
                       fontSize: 12,
                     ),
@@ -1042,7 +1056,6 @@ class _KasirPageState extends State<KasirPage> {
                     final id = item['productId'].toString();
                     final quantity = _integer(item['quantity']);
                     final price = _number(item['price']);
-
                     return Padding(
                       padding: const EdgeInsets.symmetric(vertical: 5),
                       child: Row(
@@ -1068,7 +1081,7 @@ class _KasirPageState extends State<KasirPage> {
                                 Text(
                                   _rupiah(price * quantity),
                                   style: const TextStyle(
-                                    color: Color(0xFF2563EB),
+                                    color: _primary,
                                     fontSize: 12,
                                   ),
                                 ),
@@ -1115,7 +1128,7 @@ class _KasirPageState extends State<KasirPage> {
                 Text(
                   _rupiah(_total),
                   style: const TextStyle(
-                    color: Color(0xFF2563EB),
+                    color: _primary,
                     fontSize: 19,
                     fontWeight: FontWeight.bold,
                   ),
@@ -1131,7 +1144,7 @@ class _KasirPageState extends State<KasirPage> {
                     ? null
                     : _showCheckoutDialog,
                 style: ElevatedButton.styleFrom(
-                  backgroundColor: const Color(0xFF2563EB),
+                  backgroundColor: _primary,
                   foregroundColor: Colors.white,
                   disabledBackgroundColor: Colors.grey.shade300,
                   shape: RoundedRectangleBorder(
@@ -1156,9 +1169,8 @@ class _KasirPageState extends State<KasirPage> {
   @override
   Widget build(BuildContext context) {
     final products = _filteredProducts;
-
     return Scaffold(
-      backgroundColor: const Color(0xFFF8FAFC),
+      backgroundColor: _background,
       appBar: AppBar(
         backgroundColor: Colors.white,
         surfaceTintColor: Colors.white,
@@ -1174,7 +1186,7 @@ class _KasirPageState extends State<KasirPage> {
           IconButton(
             tooltip: 'Muat ulang produk',
             onPressed: _loadProducts,
-            icon: const Icon(Icons.refresh, color: Color(0xFF2563EB)),
+            icon: const Icon(Icons.refresh, color: _primary),
           ),
         ],
       ),
@@ -1182,6 +1194,76 @@ class _KasirPageState extends State<KasirPage> {
         children: [
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(14),
+                border: Border.all(color: _border),
+              ),
+              child: Row(
+                children: [
+                  Container(
+                    width: 46,
+                    height: 46,
+                    decoration: BoxDecoration(
+                      color: _primary.withValues(alpha: 0.10),
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    child: const Icon(
+                      Icons.qr_code_scanner_rounded,
+                      color: _primary,
+                      size: 26,
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  const Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        Text(
+                          'Scan Barcode',
+                          style: TextStyle(
+                            fontSize: 14,
+                            fontWeight: FontWeight.bold,
+                            color: Color(0xFF0F172A),
+                          ),
+                        ),
+                        SizedBox(height: 3),
+                        Text(
+                          'Pindai barcode untuk menambahkan produk',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: Colors.grey,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  ElevatedButton.icon(
+                    onPressed: _scanBarcode,
+                    icon: const Icon(Icons.camera_alt_outlined, size: 18),
+                    label: const Text('Scan'),
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: _primary,
+                      foregroundColor: Colors.white,
+                      elevation: 0,
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 12,
+                        vertical: 12,
+                      ),
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(10),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+          Padding(
+            padding: const EdgeInsets.fromLTRB(16, 0, 16, 10),
             child: TextField(
               controller: _searchController,
               onChanged: (value) {
@@ -1190,28 +1272,20 @@ class _KasirPageState extends State<KasirPage> {
               decoration: InputDecoration(
                 hintText: 'Cari nama produk atau barcode...',
                 prefixIcon: const Icon(Icons.search),
-                suffixIcon: IconButton(
-                  tooltip: 'Scan barcode',
-                  onPressed: _scanBarcode,
-                  icon: const Icon(
-                    Icons.qr_code_scanner,
-                    color: Color(0xFF2563EB),
-                  ),
-                ),
                 filled: true,
                 fillColor: Colors.white,
                 border: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+                  borderSide: const BorderSide(color: _border),
                 ),
                 enabledBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
-                  borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+                  borderSide: const BorderSide(color: _border),
                 ),
                 focusedBorder: OutlineInputBorder(
                   borderRadius: BorderRadius.circular(12),
                   borderSide: const BorderSide(
-                    color: Color(0xFF2563EB),
+                    color: _primary,
                     width: 1.5,
                   ),
                 ),
@@ -1287,7 +1361,7 @@ class _KasirPageState extends State<KasirPage> {
 }
 
 class _BarcodeScannerPage extends StatefulWidget {
-  const _BarcodeScannerPage();
+  const _BarcodeScannerPage({super.key});
 
   @override
   State<_BarcodeScannerPage> createState() => _BarcodeScannerPageState();
@@ -1295,7 +1369,7 @@ class _BarcodeScannerPage extends StatefulWidget {
 
 class _BarcodeScannerPageState extends State<_BarcodeScannerPage> {
   final MobileScannerController _controller = MobileScannerController();
-  bool _scanned = false;
+  bool _hasScanned = false;
 
   @override
   void dispose() {
@@ -1303,34 +1377,79 @@ class _BarcodeScannerPageState extends State<_BarcodeScannerPage> {
     super.dispose();
   }
 
+  void _onDetect(BarcodeCapture capture) {
+    if (_hasScanned) return;
+
+    for (final barcode in capture.barcodes) {
+      final value = barcode.rawValue?.trim();
+
+      if (value != null && value.isNotEmpty) {
+        _hasScanned = true;
+        Navigator.of(context).pop(value);
+        return;
+      }
+    }
+  }
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
+      backgroundColor: Colors.black,
       appBar: AppBar(
         title: const Text('Scan Barcode'),
+        backgroundColor: const Color(0xFF2563EB),
+        foregroundColor: Colors.white,
         actions: [
           IconButton(
+            tooltip: 'Nyalakan/matikan lampu',
             onPressed: () => _controller.toggleTorch(),
-            icon: const Icon(Icons.flash_on),
+            icon: const Icon(Icons.flash_on_rounded),
           ),
           IconButton(
+            tooltip: 'Ganti kamera',
             onPressed: () => _controller.switchCamera(),
-            icon: const Icon(Icons.cameraswitch),
+            icon: const Icon(Icons.cameraswitch_rounded),
           ),
         ],
       ),
-      body: MobileScanner(
-        controller: _controller,
-        onDetect: (capture) {
-          if (_scanned || capture.barcodes.isEmpty) return;
-
-          final value = capture.barcodes.first.rawValue;
-
-          if (value == null || value.isEmpty) return;
-
-          _scanned = true;
-          Navigator.pop(context, value);
-        },
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          MobileScanner(
+            controller: _controller,
+            onDetect: _onDetect,
+          ),
+          Center(
+            child: Container(
+              width: 280,
+              height: 160,
+              decoration: BoxDecoration(
+                border: Border.all(color: Colors.white, width: 3),
+                borderRadius: BorderRadius.circular(16),
+              ),
+            ),
+          ),
+          Positioned(
+            left: 24,
+            right: 24,
+            bottom: 36,
+            child: Container(
+              padding: const EdgeInsets.all(14),
+              decoration: BoxDecoration(
+                color: Colors.black.withValues(alpha: 0.65),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: const Text(
+                'Arahkan kamera ke barcode produk sampai berhasil terbaca.',
+                textAlign: TextAlign.center,
+                style: TextStyle(
+                  color: Colors.white,
+                  fontSize: 14,
+                ),
+              ),
+            ),
+          ),
+        ],
       ),
     );
   }

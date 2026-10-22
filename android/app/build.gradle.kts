@@ -6,7 +6,10 @@ plugins {
 
 android {
     namespace = "com.example.jagatoko"
-    compileSdk = flutter.compileSdkVersion
+    
+    // Sesuai tuntutan library kamera terbaru
+    compileSdk = 36 
+    
     ndkVersion = "27.0.12077973"
 
     compileOptions {
@@ -20,8 +23,12 @@ android {
 
     defaultConfig {
         applicationId = "com.example.jagatoko"
-        minSdk = flutter.minSdkVersion
-        targetSdk = flutter.targetSdkVersion
+        
+        // Diperbarui ke 23 agar memenuhi syarat plugin mobile_scanner
+        minSdk = 23 
+        
+        targetSdk = 36 
+        
         versionCode = flutter.versionCode
         versionName = flutter.versionName
     }
