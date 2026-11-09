@@ -1,4 +1,3 @@
-
 import 'package:supabase_flutter/supabase_flutter.dart';
 
 class DatabaseService {
@@ -358,13 +357,19 @@ class DatabaseService {
 
   // ============================================================
   // PROCESS SALE
-  // RPC: SIMPAN TRANSAKSI + RINCIAN + KURANGI STOK
+  // RPC: SIMPAN TRANSAKSI + RINCIAN + DISKON + KURANGI STOK
+  //
+  // Catatan:
+  // RPC public.process_sale harus memiliki parameter:
+  // p_subtotal bigint dan p_discount bigint.
   // ============================================================
 
   Future<String> processSale({
     required String invoice,
     required String customerId,
     required String customerName,
+    required int subtotal,
+    required int discount,
     required int total,
     required int payment,
     required int change,
@@ -377,17 +382,42 @@ class DatabaseService {
       throw Exception('Tidak ada produk dalam transaksi.');
     }
 
-    if (total < 0 || payment < total || change < 0) {
+    if (subtotal < 0 ||
+        discount < 0 ||
+        discount > subtotal ||
+        total != subtotal - discount) {
+      throw Exception('Data subtotal atau diskon tidak valid.');
+    }
+
+    if (total < 0 ||
+        payment < total ||
+        change < 0 ||
+        change != payment - total) {
       throw Exception('Data pembayaran tidak valid.');
     }
 
+    if (paymentMethod != 'cash' && paymentMethod != 'qris') {
+      throw Exception('Metode pembayaran tidak valid.');
+    }
+
     final normalizedItems = items.map((item) {
+      final price = _toInt(item['price']);
+      final quantity = _toInt(item['quantity']);
+      final itemSubtotal = _toInt(item['subtotal']);
+
+      if (quantity <= 0 || price < 0) {
+        throw Exception('Harga atau jumlah produk tidak valid.');
+      }
+
       return {
         'productId': item['productId']?.toString() ?? '',
         'productName': item['productName']?.toString() ?? 'Produk',
-        'price': _toInt(item['price']),
-        'quantity': _toInt(item['quantity']),
-        'subtotal': _toInt(item['subtotal']),
+        'price': price,
+        'purchasePrice': _toInt(item['purchasePrice']),
+        'quantity': quantity,
+        'subtotal': itemSubtotal == 0
+            ? price * quantity
+            : itemSubtotal,
         'imageUrl': item['imageUrl']?.toString() ?? '',
       };
     }).toList();
@@ -398,6 +428,8 @@ class DatabaseService {
         'p_invoice': invoice,
         'p_customer_id': _nullableId(customerId),
         'p_customer_name': customerName,
+        'p_subtotal': subtotal,
+        'p_discount': discount,
         'p_total': total,
         'p_payment': payment,
         'p_change_amount': change,

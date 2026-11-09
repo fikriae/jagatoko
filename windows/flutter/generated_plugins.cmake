@@ -5,6 +5,7 @@
 list(APPEND FLUTTER_PLUGIN_LIST
   app_links
   file_selector_windows
+  print_bluetooth_thermal
   printing
   url_launcher_windows
 )

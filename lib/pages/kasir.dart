@@ -1,6 +1,10 @@
+
 import 'package:flutter/material.dart';
+import 'package:print_bluetooth_thermal/print_bluetooth_thermal.dart';
+import 'package:esc_pos_utils_plus/esc_pos_utils_plus.dart';
 import 'package:mobile_scanner/mobile_scanner.dart';
 import 'package:supabase_flutter/supabase_flutter.dart';
+
 import '../services/database_service.dart';
 
 class KasirPage extends StatefulWidget {
@@ -13,17 +17,31 @@ class KasirPage extends StatefulWidget {
 class _KasirPageState extends State<KasirPage> {
   final SupabaseClient _supabase = Supabase.instance.client;
   final DatabaseService _databaseService = DatabaseService();
-  final TextEditingController _searchController = TextEditingController();
+
+  final TextEditingController _searchController =
+      TextEditingController();
   final TextEditingController _customerController =
       TextEditingController(text: 'Umum');
-  final TextEditingController _paymentController = TextEditingController();
+  final TextEditingController _paymentController =
+      TextEditingController();
+  final TextEditingController _discountController =
+      TextEditingController();
+
   final Map<String, Map<String, dynamic>> _cart = {};
+
   String _paymentMethod = 'cash';
+  String _discountType = 'nominal';
   String _searchQuery = '';
   String _cashierName = 'Kasir';
+
   bool _loadingCheckout = false;
   bool _loadingProducts = true;
+
+  // Ukuran kertas printer thermal: 58 mm atau 80 mm.
+  int _paperWidth = 58;
+
   List<Map<String, dynamic>> _products = [];
+
   static const Color _primary = Color(0xFF2563EB);
   static const Color _background = Color(0xFFF8FAFC);
   static const Color _border = Color(0xFFE2E8F0);
@@ -40,12 +58,14 @@ class _KasirPageState extends State<KasirPage> {
     _searchController.dispose();
     _customerController.dispose();
     _paymentController.dispose();
+    _discountController.dispose();
     super.dispose();
   }
 
   double _number(dynamic value) {
     if (value is num) return value.toDouble();
     if (value == null) return 0;
+
     final cleaned = value.toString().replaceAll(',', '').trim();
     return double.tryParse(cleaned) ?? 0;
   }
@@ -55,7 +75,7 @@ class _KasirPageState extends State<KasirPage> {
     return int.tryParse(value?.toString() ?? '') ?? 0;
   }
 
-  // Sumber harga jual utama adalah kolom selling_price di Supabase.
+  // Harga jual selalu mengambil kolom selling_price.
   double _sellingPrice(Map<String, dynamic> product) {
     return _number(product['selling_price']);
   }
@@ -63,13 +83,16 @@ class _KasirPageState extends State<KasirPage> {
   String _rupiah(num value) {
     final text = value.round().abs().toString();
     final result = StringBuffer();
+
     for (int i = 0; i < text.length; i++) {
       result.write(text[i]);
       final remaining = text.length - i - 1;
+
       if (remaining > 0 && remaining % 3 == 0) {
         result.write('.');
       }
     }
+
     return '${value < 0 ? '-' : ''}Rp$result';
   }
 
@@ -82,55 +105,61 @@ class _KasirPageState extends State<KasirPage> {
     if (mounted) {
       setState(() => _loadingProducts = true);
     }
+
     try {
-      final response = await _supabase
-          .from('products')
-          .select()
-          .order('name');
+      final response =
+          await _supabase.from('products').select().order('name');
+
       final products = List<Map<String, dynamic>>.from(
         (response as List).map((row) {
           final product = Map<String, dynamic>.from(row);
-
-          // Samakan seluruh pembacaan harga dengan kolom selling_price.
           product['selling_price'] = _sellingPrice(product);
           product['price'] = _sellingPrice(product);
           return product;
         }),
       );
+
       if (!mounted) return;
+
       setState(() {
         _products = products;
 
-        // Sinkronkan harga dan stok keranjang dengan data terbaru.
         for (final entry in _cart.entries.toList()) {
           final matches = products.where(
             (product) =>
                 (product['id'] ?? '').toString() == entry.key,
           );
+
           if (matches.isEmpty) {
             _cart.remove(entry.key);
             continue;
           }
+
           final product = matches.first;
           final currentStock = _integer(product['stock']);
           final currentPrice = _sellingPrice(product);
+
           entry.value['price'] = currentPrice;
           entry.value['stock'] = currentStock;
           entry.value['productName'] =
               (product['name'] ?? 'Produk').toString();
           entry.value['imageUrl'] =
               (product['image_url'] ?? '').toString();
+
           final quantity = _integer(entry.value['quantity']);
+
           if (currentStock <= 0) {
             _cart.remove(entry.key);
           } else if (quantity > currentStock) {
             entry.value['quantity'] = currentStock;
           }
         }
+
         _loadingProducts = false;
       });
     } catch (e) {
       if (!mounted) return;
+
       setState(() => _loadingProducts = false);
       _showMessage('Gagal mengambil produk: $e');
     }
@@ -139,19 +168,23 @@ class _KasirPageState extends State<KasirPage> {
   Future<void> _loadCashier() async {
     final user = _supabase.auth.currentUser;
     if (user == null) return;
+
     try {
       final profile = await _supabase
           .from('profiles')
-          .select('name')
+          .select('full_name')
           .eq('id', user.id)
           .maybeSingle();
+
       if (!mounted) return;
+
       setState(() {
         _cashierName =
-            (profile?['name'] ?? user.email ?? 'Kasir').toString();
+            (profile?['full_name'] ?? user.email ?? 'Kasir').toString();
       });
     } catch (_) {
       if (!mounted) return;
+
       setState(() {
         _cashierName = user.email ?? 'Kasir';
       });
@@ -160,29 +193,53 @@ class _KasirPageState extends State<KasirPage> {
 
   List<Map<String, dynamic>> get _filteredProducts {
     final query = _searchQuery.trim().toLowerCase();
+
     if (query.isEmpty) return _products;
+
     return _products.where((product) {
       final name = (product['name'] ?? '').toString().toLowerCase();
       final barcode =
           (product['barcode'] ?? '').toString().toLowerCase();
+
       return name.contains(query) || barcode.contains(query);
     }).toList();
   }
 
-  double get _total {
-    double total = 0;
+  // Subtotal sebelum diskon.
+  double get _subtotal {
+    double subtotal = 0;
+
     for (final item in _cart.values) {
-      total +=
-          _number(item['price']) * _integer(item['quantity']);
+      subtotal += _number(item['price']) * _integer(item['quantity']);
     }
-    return total;
+
+    return subtotal;
+  }
+
+  // Nilai diskon berdasarkan pilihan nominal atau persentase.
+  double get _discount {
+    final input = _parsePayment(_discountController.text);
+
+    if (_discountType == 'persentase') {
+      final percentage = input.clamp(0, 100).toDouble();
+      return (_subtotal * percentage / 100).clamp(0, _subtotal).toDouble();
+    }
+
+    return input.clamp(0, _subtotal).toDouble();
+  }
+
+  // Total akhir setelah diskon.
+  double get _total {
+    return (_subtotal - _discount).clamp(0, _subtotal).toDouble();
   }
 
   int get _totalItems {
     int total = 0;
+
     for (final item in _cart.values) {
       total += _integer(item['quantity']);
     }
+
     return total;
   }
 
@@ -193,27 +250,35 @@ class _KasirPageState extends State<KasirPage> {
 
   void _addProduct(Map<String, dynamic> product) {
     final id = (product['id'] ?? '').toString();
+
     if (id.isEmpty) {
       _showMessage('Produk tidak memiliki ID.');
       return;
     }
+
     final stock = _integer(product['stock']);
     final price = _sellingPrice(product);
+
     if (stock <= 0) {
       _showMessage('Stok ${product['name']} habis.');
       return;
     }
+
     if (price < 0) {
       _showMessage('Harga produk tidak valid.');
       return;
     }
+
     final existing = _cart[id];
+
     if (existing != null) {
       final quantity = _integer(existing['quantity']);
+
       if (quantity >= stock) {
         _showMessage('Jumlah melebihi stok yang tersedia.');
         return;
       }
+
       setState(() {
         existing['quantity'] = quantity + 1;
         existing['price'] = price;
@@ -234,23 +299,28 @@ class _KasirPageState extends State<KasirPage> {
         };
       });
     }
+
     _showMessage('${product['name']} ditambahkan ke keranjang.');
   }
 
   void _changeQuantity(String id, int difference) {
     final item = _cart[id];
     if (item == null) return;
+
     final current = _integer(item['quantity']);
     final next = current + difference;
     final stock = _integer(item['stock']);
+
     if (next <= 0) {
       _removeProduct(id);
       return;
     }
+
     if (next > stock) {
       _showMessage('Jumlah tidak boleh melebihi stok.');
       return;
     }
+
     setState(() {
       item['quantity'] = next;
     });
@@ -258,6 +328,7 @@ class _KasirPageState extends State<KasirPage> {
 
   void _removeProduct(String id) {
     if (!_cart.containsKey(id)) return;
+
     setState(() {
       _cart.remove(id);
     });
@@ -265,6 +336,7 @@ class _KasirPageState extends State<KasirPage> {
 
   void _showMessage(String message) {
     if (!mounted) return;
+
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
         content: Text(message),
@@ -275,10 +347,13 @@ class _KasirPageState extends State<KasirPage> {
 
   String _generateInvoice() {
     final now = DateTime.now();
+
     final date =
         '${now.year}${now.month.toString().padLeft(2, '0')}${now.day.toString().padLeft(2, '0')}';
+
     final time =
         '${now.hour.toString().padLeft(2, '0')}${now.minute.toString().padLeft(2, '0')}${now.second.toString().padLeft(2, '0')}${now.millisecond.toString().padLeft(3, '0')}';
+
     return 'INV-$date-$time';
   }
 
@@ -289,27 +364,25 @@ class _KasirPageState extends State<KasirPage> {
         builder: (_) => const _BarcodeScannerPage(),
       ),
     );
+
     if (result == null || result.trim().isEmpty || !mounted) return;
+
     final barcode = result.trim();
+
     final matches = _products.where((product) {
       return (product['barcode'] ?? '').toString().trim() == barcode;
     }).toList();
 
-    // Barcode tidak dibiarkan tertinggal di kolom pencarian.
     setState(() {
       _searchController.clear();
       _searchQuery = '';
     });
+
     if (matches.isEmpty) {
       _showMessage('Produk dengan barcode tersebut tidak ditemukan.');
       return;
     }
 
-    // Otomatis tambahkan satu unit produk ke keranjang.
-
-    // _addProduct tetap memvalidasi stok dan menambah jumlah jika produk
-
-    // tersebut sudah ada di keranjang.
     _addProduct(matches.first);
   }
 
@@ -318,9 +391,13 @@ class _KasirPageState extends State<KasirPage> {
       _showMessage('Keranjang masih kosong.');
       return;
     }
+
     _customerController.text = 'Umum';
     _paymentMethod = 'cash';
     _paymentController.clear();
+    _discountController.clear();
+    _discountType = 'nominal';
+
     await showModalBottomSheet<void>(
       context: context,
       isScrollControlled: true,
@@ -329,11 +406,14 @@ class _KasirPageState extends State<KasirPage> {
       builder: (sheetContext) {
         return StatefulBuilder(
           builder: (context, setSheetState) {
+            final subtotal = _subtotal;
+            final discount = _discount;
             final total = _total;
             final paid = _paymentMethod == 'qris'
                 ? total
                 : _parsePayment(_paymentController.text);
             final change = paid - total;
+
             return Padding(
               padding: EdgeInsets.fromLTRB(
                 20,
@@ -375,6 +455,7 @@ class _KasirPageState extends State<KasirPage> {
                       final quantity = _integer(item['quantity']);
                       final price = _number(item['price']);
                       final id = item['productId'].toString();
+
                       return Container(
                         margin: const EdgeInsets.only(bottom: 10),
                         padding: const EdgeInsets.all(10),
@@ -416,7 +497,8 @@ class _KasirPageState extends State<KasirPage> {
                                         },
                                       ),
                                       Padding(
-                                        padding: const EdgeInsets.symmetric(
+                                        padding:
+                                            const EdgeInsets.symmetric(
                                           horizontal: 12,
                                         ),
                                         child: Text('$quantity'),
@@ -458,6 +540,90 @@ class _KasirPageState extends State<KasirPage> {
                       );
                     }),
                     const Divider(height: 24),
+                    _summaryRow(
+                      'Subtotal',
+                      _rupiah(subtotal),
+                    ),
+                    const SizedBox(height: 8),
+                    Row(
+                      children: [
+                        const Expanded(
+                          child: Text(
+                            'Jenis diskon',
+                            style: TextStyle(fontWeight: FontWeight.w600),
+                          ),
+                        ),
+                        SizedBox(
+                          width: 150,
+                          child: DropdownButtonFormField<String>(
+                            value: _discountType,
+                            isExpanded: true,
+                            decoration: InputDecoration(
+                              contentPadding: const EdgeInsets.symmetric(
+                                horizontal: 10,
+                                vertical: 10,
+                              ),
+                              border: OutlineInputBorder(
+                                borderRadius: BorderRadius.circular(10),
+                              ),
+                            ),
+                            items: const [
+                              DropdownMenuItem(
+                                value: 'nominal',
+                                child: Text('Nominal (Rp)'),
+                              ),
+                              DropdownMenuItem(
+                                value: 'persentase',
+                                child: Text('Persentase (%)'),
+                              ),
+                            ],
+                            onChanged: (value) {
+                              if (value == null) return;
+
+                              setSheetState(() {
+                                _discountType = value;
+                                _discountController.clear();
+
+                                if (_paymentMethod == 'qris') {
+                                  _paymentController.text =
+                                      _total.round().toString();
+                                }
+                              });
+                            },
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 10),
+                    TextField(
+                      controller: _discountController,
+                      keyboardType: TextInputType.number,
+                      onChanged: (_) {
+                        setSheetState(() {
+                          if (_paymentMethod == 'qris') {
+                            _paymentController.text =
+                                _total.round().toString();
+                          }
+                        });
+                      },
+                      decoration: InputDecoration(
+                        prefixText: _discountType == 'nominal' ? 'Rp ' : null,
+                        suffixText: _discountType == 'persentase' ? '%' : null,
+                        hintText: _discountType == 'nominal'
+                            ? 'Masukkan nominal diskon'
+                            : 'Masukkan persentase diskon',
+                        border: OutlineInputBorder(
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(height: 10),
+                    _summaryRow(
+                      'Potongan diskon',
+                      '- ${_rupiah(discount)}',
+                      valueColor: Colors.red,
+                    ),
+                    const Divider(height: 20),
                     _summaryRow(
                       'Total pembayaran',
                       _rupiah(total),
@@ -572,12 +738,14 @@ class _KasirPageState extends State<KasirPage> {
                                   _showMessage('Keranjang masih kosong.');
                                   return;
                                 }
+
                                 if (paid < total) {
                                   _showMessage(
                                     'Uang pembayaran belum cukup.',
                                   );
                                   return;
                                 }
+
                                 Navigator.pop(sheetContext);
                                 await _processCheckout();
                               },
@@ -617,48 +785,55 @@ class _KasirPageState extends State<KasirPage> {
 
   Future<void> _processCheckout() async {
     if (_cart.isEmpty) return;
+
     final user = _supabase.auth.currentUser;
+
     if (user == null) {
       _showMessage('Silakan login terlebih dahulu.');
       return;
     }
 
-    // Ambil ulang harga jual dan stok sebelum transaksi disimpan.
     try {
       final ids = _cart.keys.toList();
+
       final latestResponse = await _supabase
           .from('products')
           .select()
           .inFilter('id', ids);
+
       final latestProducts = List<Map<String, dynamic>>.from(
         (latestResponse as List).map(
           (row) => Map<String, dynamic>.from(row),
         ),
       );
+
       for (final entry in _cart.entries) {
         final matches = latestProducts.where(
           (product) =>
               (product['id'] ?? '').toString() == entry.key,
         );
+
         if (matches.isEmpty) {
           _showMessage(
             'Produk ${entry.value['productName']} tidak ditemukan lagi.',
           );
           return;
         }
+
         final product = matches.first;
         final latestStock = _integer(product['stock']);
         final latestPrice = _sellingPrice(product);
         final quantity = _integer(entry.value['quantity']);
+
         if (latestStock < quantity) {
           _showMessage(
-            'Stok ${product['name']} tidak cukup. Stok tersedia: $latestStock.',
+            'Stok ${product['name']} tidak cukup. '
+            'Stok tersedia: $latestStock.',
           );
           await _loadProducts();
           return;
         }
 
-        // Gunakan harga jual terbaru dari database.
         entry.value['price'] = latestPrice;
         entry.value['stock'] = latestStock;
         entry.value['productName'] =
@@ -670,21 +845,29 @@ class _KasirPageState extends State<KasirPage> {
       _showMessage('Gagal memeriksa harga dan stok terbaru: $e');
       return;
     }
+
     if (!mounted) return;
+
+    final subtotal = _subtotal;
+    final discount = _discount;
     final total = _total;
     final payment = _paymentMethod == 'qris'
         ? total
         : _parsePayment(_paymentController.text);
+
     if (payment < total) {
       _showMessage('Uang pembayaran belum cukup.');
       return;
     }
+
     final customerName = _customerController.text.trim().isEmpty
         ? 'Umum'
         : _customerController.text.trim();
+
     final items = _cart.values.map((item) {
       final price = _number(item['price']);
       final quantity = _integer(item['quantity']);
+
       return <String, dynamic>{
         'productId': item['productId'],
         'productName': item['productName'],
@@ -695,12 +878,22 @@ class _KasirPageState extends State<KasirPage> {
         'imageUrl': item['imageUrl'] ?? '',
       };
     }).toList();
+
+    final invoice = _generateInvoice();
+
+    final completedItems = items
+        .map((item) => Map<String, dynamic>.from(item))
+        .toList();
+
     setState(() => _loadingCheckout = true);
+
     try {
       await _databaseService.processSale(
-        invoice: _generateInvoice(),
+        invoice: invoice,
         customerId: '',
         customerName: customerName,
+        subtotal: subtotal.round(),
+        discount: discount.round(),
         total: total.round(),
         payment: payment.round(),
         change: (payment - total).round(),
@@ -709,18 +902,30 @@ class _KasirPageState extends State<KasirPage> {
         cashierName: _cashierName,
         items: items,
       );
+
       if (!mounted) return;
+
       final completedMethod = _paymentMethod;
+      final completedSubtotal = subtotal;
+      final completedDiscount = discount;
       final completedTotal = total;
+      final completedPayment = payment;
       final completedChange = payment - total;
+      final completedCustomerName = customerName;
+
       setState(() {
         _cart.clear();
         _paymentController.clear();
+        _discountController.clear();
+        _discountType = 'nominal';
         _customerController.text = 'Umum';
         _loadingCheckout = false;
       });
+
       await _loadProducts();
+
       if (!mounted) return;
+
       showDialog<void>(
         context: context,
         barrierDismissible: false,
@@ -738,7 +943,17 @@ class _KasirPageState extends State<KasirPage> {
             content: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
-                Text('Total: ${_rupiah(completedTotal)}'),
+                Text('Subtotal: ${_rupiah(completedSubtotal)}'),
+                const SizedBox(height: 6),
+                Text(
+                  'Diskon: ${_rupiah(completedDiscount)}',
+                  style: const TextStyle(color: Colors.red),
+                ),
+                const Divider(height: 18),
+                Text(
+                  'Total: ${_rupiah(completedTotal)}',
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
                 const SizedBox(height: 6),
                 Text('Metode: ${completedMethod.toUpperCase()}'),
                 const SizedBox(height: 6),
@@ -746,12 +961,30 @@ class _KasirPageState extends State<KasirPage> {
               ],
             ),
             actions: [
-              FilledButton(
+              OutlinedButton.icon(
                 onPressed: () => Navigator.pop(dialogContext),
+                icon: const Icon(Icons.check),
+                label: const Text('Selesai'),
+              ),
+              FilledButton.icon(
+                onPressed: () async {
+                  await _printReceipt(
+                    invoice: invoice,
+                    customerName: completedCustomerName,
+                    subtotal: completedSubtotal,
+                    discount: completedDiscount,
+                    total: completedTotal,
+                    payment: completedPayment,
+                    change: completedChange,
+                    paymentMethod: completedMethod,
+                    items: completedItems,
+                  );
+                },
                 style: FilledButton.styleFrom(
                   backgroundColor: _primary,
                 ),
-                child: const Text('Selesai'),
+                icon: const Icon(Icons.print),
+                label: const Text('Cetak'),
               ),
             ],
           );
@@ -759,8 +992,303 @@ class _KasirPageState extends State<KasirPage> {
       );
     } catch (e) {
       if (!mounted) return;
+
       setState(() => _loadingCheckout = false);
       _showMessage('Transaksi gagal: $e');
+    }
+  }
+
+  Future<bool> _printReceipt({
+    required String invoice,
+    required String customerName,
+    required num subtotal,
+    required num discount,
+    required num total,
+    required num payment,
+    required num change,
+    required String paymentMethod,
+    required List<Map<String, dynamic>> items,
+  }) async {
+    try {
+      // Pastikan Bluetooth HP aktif.
+      final bluetoothEnabled =
+          await PrintBluetoothThermal.bluetoothEnabled;
+
+      if (!bluetoothEnabled) {
+        _showMessage(
+          'Bluetooth HP belum aktif. Aktifkan Bluetooth terlebih dahulu.',
+        );
+        return false;
+      }
+
+      // Periksa izin Bluetooth.
+      final permissionGranted =
+          await PrintBluetoothThermal.isPermissionBluetoothGranted;
+
+      if (!permissionGranted) {
+        _showMessage(
+          'Izin Bluetooth belum diberikan. '
+          'Periksa izin aplikasi Jagatoko di Pengaturan HP.',
+        );
+        return false;
+      }
+
+      // Periksa perangkat yang sudah dipasangkan.
+      final devices = await PrintBluetoothThermal.pairedBluetooths;
+
+      if (devices.isEmpty) {
+        _showMessage(
+          'Printer belum dipasangkan. '
+          'Pasangkan printer melalui Pengaturan Bluetooth HP terlebih dahulu.',
+        );
+        return false;
+      }
+
+      if (!mounted) return false;
+
+      // Pilih printer sekaligus ukuran kertas.
+      final selectedPrinter = await showDialog<BluetoothInfo>(
+        context: context,
+        builder: (dialogContext) {
+          return StatefulBuilder(
+            builder: (context, setDialogState) {
+              return AlertDialog(
+                title: const Text('Pengaturan Cetak Struk'),
+                content: SizedBox(
+                  width: double.maxFinite,
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        'Ukuran kertas',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButtonFormField<int>(
+                        value: _paperWidth,
+                        decoration: const InputDecoration(
+                          border: OutlineInputBorder(),
+                          contentPadding: EdgeInsets.symmetric(
+                            horizontal: 12,
+                            vertical: 10,
+                          ),
+                        ),
+                        items: const [
+                          DropdownMenuItem(
+                            value: 58,
+                            child: Text('Thermal 58 mm'),
+                          ),
+                          DropdownMenuItem(
+                            value: 80,
+                            child: Text('Thermal 80 mm'),
+                          ),
+                        ],
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setDialogState(() {
+                            _paperWidth = value;
+                          });
+                        },
+                      ),
+                      const SizedBox(height: 18),
+                      const Text(
+                        'Pilih printer Bluetooth',
+                        style: TextStyle(fontWeight: FontWeight.w600),
+                      ),
+                      const SizedBox(height: 8),
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(
+                          maxHeight: 250,
+                        ),
+                        child: ListView.separated(
+                          shrinkWrap: true,
+                          itemCount: devices.length,
+                          separatorBuilder: (_, __) =>
+                              const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final device = devices[index];
+
+                            return ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              leading: const Icon(
+                                Icons.print,
+                                color: _primary,
+                              ),
+                              title: Text(
+                                device.name.isEmpty
+                                    ? 'Printer Bluetooth'
+                                    : device.name,
+                              ),
+                              subtitle: Text(device.macAdress),
+                              onTap: () {
+                                Navigator.pop(dialogContext, device);
+                              },
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                actions: [
+                  TextButton(
+                    onPressed: () => Navigator.pop(dialogContext),
+                    child: const Text('Batal'),
+                  ),
+                ],
+              );
+            },
+          );
+        },
+      );
+
+      if (selectedPrinter == null) {
+        _showMessage('Pemilihan printer dibatalkan.');
+        return false;
+      }
+
+      // Tutup koneksi lama jika masih tersambung.
+      final alreadyConnected =
+          await PrintBluetoothThermal.connectionStatus;
+
+      if (alreadyConnected) {
+        await PrintBluetoothThermal.disconnect;
+      }
+
+      // Hubungkan printer yang dipilih.
+      _showMessage(
+        'Menghubungkan ke printer ${selectedPrinter.name}...',
+      );
+
+      final connected = await PrintBluetoothThermal.connect(
+        macPrinterAddress: selectedPrinter.macAdress,
+      );
+
+      if (!connected) {
+        _showMessage(
+          'Gagal terhubung ke printer ${selectedPrinter.name}. '
+          'Pastikan printer menyala dan sudah dipasangkan.',
+        );
+        return false;
+      }
+
+      // Buat data struk dengan lebar kertas pilihan.
+      final profile = await CapabilityProfile.load();
+
+      final paperSize =
+          _paperWidth == 80 ? PaperSize.mm80 : PaperSize.mm58;
+
+      final generator = Generator(paperSize, profile);
+      final List<int> bytes = [];
+
+      bytes.addAll(
+        generator.text(
+          'JAGATOKO',
+          styles: const PosStyles(
+            align: PosAlign.center,
+            bold: true,
+            height: PosTextSize.size2,
+            width: PosTextSize.size2,
+          ),
+        ),
+      );
+
+      bytes.addAll(
+        generator.text(
+          'STRUK PEMBELIAN',
+          styles: const PosStyles(align: PosAlign.center),
+        ),
+      );
+
+      bytes.addAll(generator.hr());
+      bytes.addAll(generator.text('Invoice: $invoice'));
+      bytes.addAll(generator.text('Pelanggan: $customerName'));
+      bytes.addAll(generator.text('Kasir: $_cashierName'));
+      bytes.addAll(
+        generator.text(
+          'Pembayaran: ${paymentMethod.toUpperCase()}',
+        ),
+      );
+      bytes.addAll(generator.hr());
+
+      for (final item in items) {
+        final name = (item['productName'] ?? 'Produk').toString();
+        final quantity = _integer(item['quantity']);
+        final price = _number(item['price']);
+        final subtotal = _number(item['subtotal']);
+
+        bytes.addAll(generator.text(name));
+        bytes.addAll(
+          generator.text(
+            '$quantity x ${_rupiah(price)} = ${_rupiah(subtotal)}',
+          ),
+        );
+      }
+
+      bytes.addAll(generator.hr());
+
+      bytes.addAll(
+        generator.text('Subtotal: ${_rupiah(subtotal)}'),
+      );
+
+      bytes.addAll(
+        generator.text(
+          'Diskon: -${_rupiah(discount)}',
+          styles: const PosStyles(bold: true),
+        ),
+      );
+
+      bytes.addAll(generator.hr());
+
+      bytes.addAll(
+        generator.text(
+          'TOTAL: ${_rupiah(total)}',
+          styles: const PosStyles(
+            bold: true,
+            height: PosTextSize.size2,
+          ),
+        ),
+      );
+
+      bytes.addAll(generator.text('Dibayar: ${_rupiah(payment)}'));
+      bytes.addAll(generator.text('Kembalian: ${_rupiah(change)}'));
+      bytes.addAll(generator.hr());
+
+      bytes.addAll(
+        generator.text(
+          'Terima kasih telah berbelanja',
+          styles: const PosStyles(align: PosAlign.center),
+        ),
+      );
+
+      bytes.addAll(
+        generator.text(
+          'di Jagatoko',
+          styles: const PosStyles(align: PosAlign.center),
+        ),
+      );
+
+      bytes.addAll(generator.feed(3));
+
+      // Kirim data ke printer.
+      final printed = await PrintBluetoothThermal.writeBytes(bytes);
+
+      if (!printed) {
+        _showMessage(
+          'Struk gagal dicetak. Periksa koneksi dan kertas printer.',
+        );
+        return false;
+      }
+
+      _showMessage(
+        'Struk berhasil dikirim ke printer ${selectedPrinter.name}.',
+      );
+
+      return true;
+    } catch (e) {
+      _showMessage('Gagal mencetak struk: $e');
+      return false;
     }
   }
 
@@ -882,6 +1410,7 @@ class _KasirPageState extends State<KasirPage> {
     final stock = _integer(product['stock']);
     final imageUrl = (product['image_url'] ?? '').toString();
     final inCart = _cart.containsKey(id);
+
     return Container(
       decoration: BoxDecoration(
         color: Colors.white,
@@ -959,11 +1488,12 @@ class _KasirPageState extends State<KasirPage> {
                   width: double.infinity,
                   height: 36,
                   child: ElevatedButton.icon(
-                    onPressed: stock <= 0
-                        ? null
-                        : () => _addProduct(product),
+                    onPressed:
+                        stock <= 0 ? null : () => _addProduct(product),
                     icon: Icon(
-                      inCart ? Icons.add : Icons.add_shopping_cart,
+                      inCart
+                          ? Icons.add
+                          : Icons.add_shopping_cart,
                       size: 16,
                     ),
                     label: Text(
@@ -1056,6 +1586,7 @@ class _KasirPageState extends State<KasirPage> {
                     final id = item['productId'].toString();
                     final quantity = _integer(item['quantity']);
                     final price = _number(item['price']);
+
                     return Padding(
                       padding: const EdgeInsets.symmetric(vertical: 5),
                       child: Row(
@@ -1169,6 +1700,7 @@ class _KasirPageState extends State<KasirPage> {
   @override
   Widget build(BuildContext context) {
     final products = _filteredProducts;
+
     return Scaffold(
       backgroundColor: _background,
       appBar: AppBar(
@@ -1243,7 +1775,10 @@ class _KasirPageState extends State<KasirPage> {
                   const SizedBox(width: 8),
                   ElevatedButton.icon(
                     onPressed: _scanBarcode,
-                    icon: const Icon(Icons.camera_alt_outlined, size: 18),
+                    icon: const Icon(
+                      Icons.camera_alt_outlined,
+                      size: 18,
+                    ),
                     label: const Text('Scan'),
                     style: ElevatedButton.styleFrom(
                       backgroundColor: _primary,
@@ -1339,7 +1874,12 @@ class _KasirPageState extends State<KasirPage> {
                         ),
                       )
                     : GridView.builder(
-                        padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
+                        padding: const EdgeInsets.fromLTRB(
+                          16,
+                          0,
+                          16,
+                          16,
+                        ),
                         gridDelegate:
                             const SliverGridDelegateWithFixedCrossAxisCount(
                           crossAxisCount: 2,
@@ -1364,7 +1904,8 @@ class _BarcodeScannerPage extends StatefulWidget {
   const _BarcodeScannerPage({super.key});
 
   @override
-  State<_BarcodeScannerPage> createState() => _BarcodeScannerPageState();
+  State<_BarcodeScannerPage> createState() =>
+      _BarcodeScannerPageState();
 }
 
 class _BarcodeScannerPageState extends State<_BarcodeScannerPage> {
